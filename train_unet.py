@@ -269,7 +269,11 @@ def train_one_config(
     criterion = nn.BCEWithLogitsLoss()
     optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = ReduceLROnPlateau(
+<<<<<<< HEAD
         optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6, verbose=True
+=======
+        optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6
+>>>>>>> 6aa07d9 (add)
     )
 
     best_dice = -1.0
