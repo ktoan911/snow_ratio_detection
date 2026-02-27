@@ -160,8 +160,8 @@ class SnowSegDataset(Dataset):
         img = TF.to_tensor(img)  # [3, H, W], float32 [0,1]
         img = self.normalize(img)
 
-        mask = torch.from_numpy(np.array(mask)).float()  # [H, W]
-        mask = (mask > 127).float().unsqueeze(0)  # [1, H, W], binary {0,1}
+        arr = np.array(mask)  # uint8
+        mask = torch.from_numpy((arr > 0).astype(np.float32)).unsqueeze(0)
 
         return img, mask, str(img_path.name)
 
