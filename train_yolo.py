@@ -68,7 +68,8 @@ def mask_png_to_yolo_label(mask_path: Path, label_path: Path):
     Nếu không có contour (ảnh trắng toàn bộ hoặc đen toàn bộ) → file rỗng.
     """
     arr = np.array(Image.open(mask_path).convert("L"))
-    binary = (arr > 127).astype(np.uint8) * 255
+    # Hỗ trợ cả mask 0/1 (label_unet) lẫn 0/255
+    binary = (arr > 0).astype(np.uint8) * 255
     h, w = binary.shape
 
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -338,6 +339,12 @@ def train_one_config(
     best_pt_src = None  # path đến weights YOLO tốt nhất từng epoch
 
     for epoch in range(1, max_epochs + 1):
+        # ── Reload từ last.pt để tránh KeyError: 'model' sau lần train đầu ──
+        if epoch > 1:
+            last_pt = run_dir / "train" / "weights" / "last.pt"
+            if last_pt.exists():
+                model = YOLO(str(last_pt))
+
         # ── Train 1 epoch ────────────────────────────────────────────────
         train_result = model.train(
             data=str(yaml_path),
