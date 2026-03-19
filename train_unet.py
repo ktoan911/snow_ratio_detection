@@ -273,6 +273,8 @@ def train_one_config(
     )
 
     best_dice = -1.0
+    best_metrics = {}
+    best_epoch = 0
     no_improve = 0
     best_path = result_dir / f"best_{lr_tag}.pth"
 
@@ -347,6 +349,16 @@ def train_one_config(
         # Lưu model tốt nhất
         if v_metrics["dice"] > best_dice:
             best_dice = v_metrics["dice"]
+            best_epoch = epoch
+            best_metrics = {
+                "val_loss": v_loss,
+                "dice": v_metrics["dice"],
+                "precision": v_metrics["precision"],
+                "recall": v_metrics["recall"],
+                "f1": v_metrics["f1"],
+                "accuracy": v_metrics["accuracy"],
+                "miou": v_metrics["miou"],
+            }
             no_improve = 0
             torch.save(
                 {
@@ -368,7 +380,9 @@ def train_one_config(
             )
             break
 
-    print(f"\n  Best val Dice ({lr_tag}): {best_dice:.4f}  → lưu tại {best_path}")
+    print(
+        f"\n  Best val Dice ({lr_tag}): {best_dice:.4f}  @ epoch {best_epoch}  → lưu tại {best_path}"
+    )
 
     # Vẽ biểu đồ
     plot_curves(history, lr_tag, result_dir)
@@ -378,7 +392,7 @@ def train_one_config(
     with open(hist_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
-    return best_dice
+    return best_epoch, best_metrics
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -480,7 +494,7 @@ def main():
 
     summary = {}
     for lr, lr_tag in lr_configs:
-        best_dice = train_one_config(
+        best_epoch, best_metrics = train_one_config(
             train_loader,
             val_loader,
             lr=lr,
@@ -490,18 +504,48 @@ def main():
             max_epochs=args.max_epochs,
             early_patience=args.early_patience,
         )
-        summary[lr_tag] = {"lr": lr, "best_val_dice": best_dice}
+        summary[lr_tag] = {
+            "lr": lr,
+            "best_epoch": best_epoch,
+            **best_metrics,
+        }
 
-    # ── In tóm tắt ─────────────────────────────────────────────────────────
-    print(f"\n{'=' * 60}")
-    print("  TỔNG KẾT:")
+    # ── Bảng tổng kết chi tiết ─────────────────────────────────────────────
+    col_w = 10  # độ rộng mỗi cột metric
+    metrics_order = ["dice", "precision", "recall", "f1", "accuracy", "miou"]
+    header_names = ["Dice", "Precision", "Recall", "F1", "Accuracy", "mIoU"]
+
+    sep = "─" * (8 + 6 + 8 + len(metrics_order) * (col_w + 3) + 1)
+    print(f"\n\n{'═' * len(sep)}")
+    print("  📊  KẾT QUẢ TỔNG KẾT SAU TRAINING")
+    print(f"{'═' * len(sep)}")
+
+    # Header
+    row_fmt = "  {:<8}  {:<6}  {:<8}"
+    for _ in metrics_order:
+        row_fmt += f"  {{:>{col_w}}}"
+    print(row_fmt.format("Tag", "LR", "BestEpoch", *header_names))
+    print(sep)
+
+    # Tìm giá trị cao nhất cho từng metric để highlight
+    best_vals = {m: max(info[m] for info in summary.values()) for m in metrics_order}
+
     for tag, info in summary.items():
-        print(
-            f"    {tag} (lr={info['lr']:.0e}):  Best val Dice = {info['best_val_dice']:.4f}"
-        )
-    print(f"{'=' * 60}")
+        lr_str = f"{info['lr']:.0e}"
+        vals = []
+        for m in metrics_order:
+            v = info[m]
+            cell = f"{v:.4f}"
+            if abs(v - best_vals[m]) < 1e-9:  # là giá trị tốt nhất
+                cell = f"★{v:.4f}"  # đánh dấu sao
+            vals.append(cell.rjust(col_w))
+        print(f"  {tag:<8}  {lr_str:<6}  {info['best_epoch']:<8}  {'  '.join(vals)}")
 
-    # Lưu summary
+    print(sep)
+    print("  ★ = giá trị tốt nhất trong nhóm LR")
+    print(f"{'═' * len(sep)}\n")
+
+    # Lưu summary JSON
     summary_path = result_dir / "summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

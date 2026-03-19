@@ -1,1 +1,0 @@
-# snow_ratio_detection

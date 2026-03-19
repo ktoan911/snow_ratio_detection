@@ -1,8 +1,6 @@
 example
 label_unet
-<<<<<<< HEAD
-venv
-=======
+data2
 venv
 data
->>>>>>> 6aa07d9 (add)
+model
