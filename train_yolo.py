@@ -450,7 +450,7 @@ def train_one_config(
         seed=SEED,
         patience=0,  # tắt YOLO early-stopping, dùng callback tự quản
         save=True,
-        save_period=1,  # lưu last.pt mỗi epoch để callback có thể đọc
+        save_period=-1,  # chỉ lưu best.pt + last.pt, không lưu epoch*.pt (tốn disk)
     )
 
     best_dice = state["best_dice"]
