@@ -292,7 +292,7 @@ def plot_curves(history: dict, lr_tag: str, result_dir: Path):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Finetune một lần với lr cụ thể
+# Finetune một lần với lr cụ thể  — dùng ultralytics callback
 # ═══════════════════════════════════════════════════════════════════════════
 def train_one_config(
     yaml_path: Path,
@@ -314,96 +314,72 @@ def train_one_config(
     run_dir = result_dir / f"best_{lr_tag}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Load pre-trained YOLOv8s-seg ─────────────────────────────────────
-    model = YOLO("yolov8s-seg.pt")
-
-    history = {
-        k: []
-        for k in [
-            "train_loss",
-            "val_loss",
-            "train_dice",
-            "val_dice",
-            "val_precision",
-            "val_recall",
-            "val_f1",
-            "val_accuracy",
-            "val_miou",
-        ]
+    # ── State được chia sẻ với callback (dùng dict để tránh closure capture issue) ──
+    state = {
+        "history": {
+            k: []
+            for k in [
+                "train_loss",
+                "val_loss",
+                "train_dice",
+                "val_dice",
+                "val_precision",
+                "val_recall",
+                "val_f1",
+                "val_accuracy",
+                "val_miou",
+            ]
+        },
+        "best_dice": -1.0,
+        "best_metrics": {},
+        "best_epoch": 0,
+        "no_improve": 0,
+        "stop": False,
     }
 
-    best_dice = -1.0
-    best_metrics = {}
-    best_epoch = 0
-    no_improve = 0
-    best_pt_src = None  # path đến weights YOLO tốt nhất từng epoch
+    # ── Callback chạy sau mỗi epoch val ─────────────────────────────────────
+    def on_val_end(trainer):
+        epoch = trainer.epoch + 1  # ultralytics dùng 0-indexed
 
-    for epoch in range(1, max_epochs + 1):
-        # ── Reload từ last.pt để tránh KeyError: 'model' sau lần train đầu ──
-        if epoch > 1:
-            last_pt = run_dir / "train" / "weights" / "last.pt"
-            if last_pt.exists():
-                model = YOLO(str(last_pt))
-
-        # ── Train 1 epoch ────────────────────────────────────────────────
-        train_result = model.train(
-            data=str(yaml_path),
-            epochs=1,
-            imgsz=IMG_SIZE,
-            batch=batch_size,
-            lr0=lr,
-            lrf=1.0,  # giữ LR cố định = lr0 (không decay) khi train từng epoch
-            warmup_epochs=0,  # tắt warmup để model học ngay từ epoch 1
-            optimizer="Adam",
-            device=device,
-            project=str(run_dir),
-            name="train",
-            exist_ok=True,
-            verbose=False,
-            # tắt augmentation nặng để training ổn định hơn
-            mosaic=0.0,
-            mixup=0.0,
-            copy_paste=0.0,
-            degrees=20.0,
-            translate=0.1,
-            flipud=0.0,
-            fliplr=0.5,
-            seed=SEED,
-            patience=0,  # tự quản early-stopping
-            save=True,
-            save_period=-1,  # chỉ lưu best/last tự động
+        # ── Train loss từ trainer metrics ────────────────────────────────
+        rd = trainer.metrics if hasattr(trainer, "metrics") else {}
+        t_loss = float(
+            rd.get(
+                "train/seg_loss",
+                rd.get("train/loss", rd.get("metrics/seg_loss(B)", 0.0)),
+            )
         )
 
-        # ── Lấy train loss từ kết quả ultralytics ────────────────────────
-        # train_result.results_dict chứa các key tuỳ version
-        rd = train_result.results_dict if hasattr(train_result, "results_dict") else {}
-        t_loss = float(rd.get("train/seg_loss", rd.get("train/loss", 0.0)))
-
-        # ── Val loss (dùng YOLO built-in) ─────────────────────────────────
-        val_result = model.val(
-            data=str(yaml_path),
-            imgsz=IMG_SIZE,
-            batch=batch_size,
-            device=device,
-            verbose=False,
+        # ── Val loss ─────────────────────────────────────────────────────
+        v_loss = float(
+            rd.get("val/seg_loss", rd.get("val/loss", rd.get("val(B)/seg_loss", 0.0)))
         )
-        vrd = val_result.results_dict if hasattr(val_result, "results_dict") else {}
-        v_loss = float(vrd.get("val/seg_loss", vrd.get("val/loss", 0.0)))
 
-        # ── Tính metrics bằng inference trực tiếp trên val set ───────────
+        # ── Custom metrics bằng inference ────────────────────────────────
+        # Tạm thời dùng trainer.model để tránh tải lại file
+        yolo_model = (
+            YOLO(str(run_dir / "train" / "weights" / "last.pt"))
+            if (run_dir / "train" / "weights" / "last.pt").exists()
+            else None
+        )
+
+        if yolo_model is None:
+            return  # chưa có weights, bỏ qua
+
         t_counts, v_counts = {}, {}
-        accumulate_metrics(t_counts, model, train_imgs, label_dir, device)
-        accumulate_metrics(v_counts, model, val_imgs, label_dir, device)
+        accumulate_metrics(t_counts, yolo_model, train_imgs, label_dir, device)
+        accumulate_metrics(v_counts, yolo_model, val_imgs, label_dir, device)
         t_metrics = counts_to_metrics(t_counts)
         v_metrics = counts_to_metrics(v_counts)
 
         # Ghi history
-        history["train_loss"].append(t_loss)
-        history["val_loss"].append(v_loss)
-        history["train_dice"].append(t_metrics["dice"])
-        history["val_dice"].append(v_metrics["dice"])
+        h = state["history"]
+        h["train_loss"].append(t_loss)
+        h["val_loss"].append(v_loss)
+        h["train_dice"].append(t_metrics["dice"])
+        h["val_dice"].append(v_metrics["dice"])
         for k in ["precision", "recall", "f1", "accuracy", "miou"]:
-            history[f"val_{k}"].append(v_metrics[k])
+            h[f"val_{k}"].append(v_metrics[k])
 
         # Log mỗi 10 epoch
         if epoch % 10 == 0 or epoch == 1:
@@ -414,11 +390,11 @@ def train_one_config(
                 f"mIoU={v_metrics['miou']:.4f}  F1={v_metrics['f1']:.4f}"
             )
 
-        # ── Lưu model tốt nhất ──────────────────────────────────────────
-        if v_metrics["dice"] > best_dice:
-            best_dice = v_metrics["dice"]
-            best_epoch = epoch
-            best_metrics = {
+        # Early stopping theo val Dice
+        if v_metrics["dice"] > state["best_dice"]:
+            state["best_dice"] = v_metrics["dice"]
+            state["best_epoch"] = epoch
+            state["best_metrics"] = {
                 "val_loss": v_loss,
                 "dice": v_metrics["dice"],
                 "precision": v_metrics["precision"],
@@ -427,26 +403,63 @@ def train_one_config(
                 "accuracy": v_metrics["accuracy"],
                 "miou": v_metrics["miou"],
             }
-            no_improve = 0
+            state["no_improve"] = 0
 
-            # Tìm weights/best.pt hoặc last.pt mà YOLO vừa lưu
+            # Copy best weights
             candidate = run_dir / "train" / "weights" / "best.pt"
             if not candidate.exists():
                 candidate = run_dir / "train" / "weights" / "last.pt"
             if candidate.exists():
-                best_pt_dst = run_dir / "best_model.pt"
-                shutil.copy2(candidate, best_pt_dst)
-                best_pt_src = best_pt_dst
+                shutil.copy2(candidate, run_dir / "best_model.pt")
         else:
-            no_improve += 1
+            state["no_improve"] += 1
 
-        # Early stopping
-        if no_improve >= early_patience:
+        # Báo trainer dừng khi hết patience
+        if state["no_improve"] >= early_patience:
             print(
                 f"\n  [EARLY STOP] Không cải thiện sau {early_patience} epoch. "
                 f"Dừng tại epoch {epoch}."
             )
-            break
+            trainer.stop = True  # ultralytics kiểm tra flag này
+
+    # ── Load model và gắn callback ────────────────────────────────────────
+    model = YOLO("yolov8s-seg.pt")
+    model.add_callback("on_val_end", on_val_end)
+
+    # ── Train toàn bộ epochs trong 1 lần gọi ─────────────────────────────
+    model.train(
+        data=str(yaml_path),
+        epochs=max_epochs,
+        imgsz=IMG_SIZE,
+        batch=batch_size,
+        lr0=lr,
+        lrf=0.01,  # cosine decay từ lr0 → lr0*0.01 theo đúng schedule
+        warmup_epochs=3,  # warmup chuẩn (3 epoch đầu)
+        optimizer="Adam",
+        device=device,
+        project=str(run_dir),
+        name="train",
+        exist_ok=True,
+        verbose=False,
+        # Augmentation
+        mosaic=0.0,
+        mixup=0.0,
+        copy_paste=0.0,
+        degrees=20.0,
+        translate=0.1,
+        flipud=0.0,
+        fliplr=0.5,
+        seed=SEED,
+        patience=0,  # tắt YOLO early-stopping, dùng callback tự quản
+        save=True,
+        save_period=1,  # lưu last.pt mỗi epoch để callback có thể đọc
+    )
+
+    best_dice = state["best_dice"]
+    best_epoch = state["best_epoch"]
+    best_metrics = state["best_metrics"]
+    best_pt_src = run_dir / "best_model.pt"
+    history = state["history"]
 
     print(
         f"\n  Best val Dice ({lr_tag}): {best_dice:.4f}  "
