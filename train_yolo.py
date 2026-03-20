@@ -338,33 +338,31 @@ def train_one_config(
     }
 
     # ── Callback chạy sau mỗi epoch val ─────────────────────────────────────
-    def on_val_end(trainer):
-        epoch = trainer.epoch + 1  # ultralytics dùng 0-indexed
+    # on_val_end nhận Validator (không phải Trainer) — lấy trainer qua .trainer
+    def on_val_end(validator):
+        tr = getattr(validator, "trainer", None)
+        if tr is None:
+            return
+        epoch = tr.epoch + 1  # ultralytics dùng 0-indexed
 
-        # ── Train loss từ trainer metrics ────────────────────────────────
-        rd = trainer.metrics if hasattr(trainer, "metrics") else {}
+        # ── Train / Val loss từ trainer metrics ──────────────────────────
+        rd = tr.metrics if hasattr(tr, "metrics") else {}
         t_loss = float(
             rd.get(
                 "train/seg_loss",
                 rd.get("train/loss", rd.get("metrics/seg_loss(B)", 0.0)),
             )
         )
-
-        # ── Val loss ─────────────────────────────────────────────────────
         v_loss = float(
             rd.get("val/seg_loss", rd.get("val/loss", rd.get("val(B)/seg_loss", 0.0)))
         )
 
         # ── Custom metrics bằng inference ────────────────────────────────
-        # Tạm thời dùng trainer.model để tránh tải lại file
-        yolo_model = (
-            YOLO(str(run_dir / "train" / "weights" / "last.pt"))
-            if (run_dir / "train" / "weights" / "last.pt").exists()
-            else None
-        )
+        last_pt = run_dir / "train" / "weights" / "last.pt"
+        if not last_pt.exists():
+            return
 
-        if yolo_model is None:
-            return  # chưa có weights, bỏ qua
+        yolo_model = YOLO(str(last_pt))
 
         t_counts, v_counts = {}, {}
         accumulate_metrics(t_counts, yolo_model, train_imgs, label_dir, device)
@@ -420,7 +418,7 @@ def train_one_config(
                 f"\n  [EARLY STOP] Không cải thiện sau {early_patience} epoch. "
                 f"Dừng tại epoch {epoch}."
             )
-            trainer.stop = True  # ultralytics kiểm tra flag này
+            tr.stop = True  # ultralytics kiểm tra flag này trên Trainer
 
     # ── Load model và gắn callback ────────────────────────────────────────
     model = YOLO("yolov8s-seg.pt")
