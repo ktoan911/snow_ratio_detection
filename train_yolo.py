@@ -337,16 +337,13 @@ def train_one_config(
         "stop": False,
     }
 
-    # ── Callback chạy sau mỗi epoch val ─────────────────────────────────────
-    # on_val_end nhận Validator (không phải Trainer) — lấy trainer qua .trainer
-    def on_val_end(validator):
-        tr = getattr(validator, "trainer", None)
-        if tr is None:
-            return
-        epoch = tr.epoch + 1  # ultralytics dùng 0-indexed
+    # ── Callback chạy sau mỗi epoch (train + val hoàn chỉnh) ───────────────
+    # on_fit_epoch_end nhận Trainer trực tiếp (khác on_val_end nhận Validator)
+    def on_fit_epoch_end(trainer):
+        epoch = trainer.epoch + 1  # ultralytics dùng 0-indexed
 
-        # ── Train / Val loss từ trainer metrics ──────────────────────────
-        rd = tr.metrics if hasattr(tr, "metrics") else {}
+        # ── Train / Val loss từ trainer.metrics ──────────────────────────
+        rd = trainer.metrics if hasattr(trainer, "metrics") else {}
         t_loss = float(
             rd.get(
                 "train/seg_loss",
@@ -357,12 +354,17 @@ def train_one_config(
             rd.get("val/seg_loss", rd.get("val/loss", rd.get("val(B)/seg_loss", 0.0)))
         )
 
-        # ── Custom metrics bằng inference ────────────────────────────────
+        # ── Custom metrics: dùng last.pt vừa lưu (on_fit_epoch_end fire
+        #    sau save_model) hoặc fallback sang best.pt/trainer weights ──
         last_pt = run_dir / "train" / "weights" / "last.pt"
-        if not last_pt.exists():
-            return
+        best_pt = run_dir / "train" / "weights" / "best.pt"
+        weight_path = (
+            last_pt if last_pt.exists() else (best_pt if best_pt.exists() else None)
+        )
+        if weight_path is None:
+            return  # epoch 1 chưa lưu gì, bỏ qua
 
-        yolo_model = YOLO(str(last_pt))
+        yolo_model = YOLO(str(weight_path))
 
         t_counts, v_counts = {}, {}
         accumulate_metrics(t_counts, yolo_model, train_imgs, label_dir, device)
@@ -404,10 +406,10 @@ def train_one_config(
             state["no_improve"] = 0
 
             # Copy best weights
-            candidate = run_dir / "train" / "weights" / "best.pt"
-            if not candidate.exists():
-                candidate = run_dir / "train" / "weights" / "last.pt"
-            if candidate.exists():
+            candidate = (
+                best_pt if best_pt.exists() else (last_pt if last_pt.exists() else None)
+            )
+            if candidate:
                 shutil.copy2(candidate, run_dir / "best_model.pt")
         else:
             state["no_improve"] += 1
@@ -418,11 +420,11 @@ def train_one_config(
                 f"\n  [EARLY STOP] Không cải thiện sau {early_patience} epoch. "
                 f"Dừng tại epoch {epoch}."
             )
-            tr.stop = True  # ultralytics kiểm tra flag này trên Trainer
+            trainer.stop = True
 
     # ── Load model và gắn callback ────────────────────────────────────────
     model = YOLO("yolov8s-seg.pt")
-    model.add_callback("on_val_end", on_val_end)
+    model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
 
     # ── Train toàn bộ epochs trong 1 lần gọi ─────────────────────────────
     model.train(
@@ -597,6 +599,12 @@ def main():
         row_fmt += f"  {{:>{col_w}}}"
     print(row_fmt.format("Tag", "LR", "BestEpoch", *header_names))
     print(sep)
+
+    # Nếu callback không chạy được (ví dụ history rỗng), fallback sang 0.0
+    for tag, info in summary.items():
+        for m in metrics_order:
+            if m not in info:
+                info[m] = 0.0
 
     best_vals = {m: max(info[m] for info in summary.values()) for m in metrics_order}
 
