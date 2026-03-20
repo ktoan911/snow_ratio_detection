@@ -194,15 +194,15 @@ def accumulate_metrics(
                 .convert("L")
                 .resize((IMG_SIZE, IMG_SIZE), Image.NEAREST)
             )
-            > 127
+            > 0  # dùng > 0 thay vì > 127 vì mask label_unet lưu giá trị 0/1 (không phải 0/255)
         )  # bool HxW
 
         # ── Predict ──────────────────────────────────────────────────────
         results = model.predict(
             str(p),
             imgsz=IMG_SIZE,
-            conf=0.25,
-            iou=0.5,
+            conf=0.01,  # thấp để catch prediction dù model chưa confident
+            iou=0.3,
             device=device,
             verbose=False,
             stream=False,
@@ -352,7 +352,8 @@ def train_one_config(
             imgsz=IMG_SIZE,
             batch=batch_size,
             lr0=lr,
-            lrf=0.01,  # lr cuối = lr * lrf
+            lrf=1.0,  # giữ LR cố định = lr0 (không decay) khi train từng epoch
+            warmup_epochs=0,  # tắt warmup để model học ngay từ epoch 1
             optimizer="Adam",
             device=device,
             project=str(run_dir),
