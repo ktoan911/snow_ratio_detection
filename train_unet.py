@@ -177,16 +177,22 @@ def accumulate_counts(acc: dict, pred_logits: torch.Tensor, target: torch.Tensor
     Cộng dồn raw TP/FP/FN/TN vào acc cho toàn epoch.
     acc: dict {'tp', 'fp', 'fn', 'tn'}
     """
-    pred = (torch.sigmoid(pred_logits) > THRESHOLD).float()
-    acc["tp"] = acc.get("tp", 0.0) + (pred * target).sum().item()
-    acc["fp"] = acc.get("fp", 0.0) + (pred * (1 - target)).sum().item()
-    acc["fn"] = acc.get("fn", 0.0) + ((1 - pred) * target).sum().item()
-    acc["tn"] = acc.get("tn", 0.0) + ((1 - pred) * (1 - target)).sum().item()
+    with torch.no_grad():
+        pred = (torch.sigmoid(pred_logits) > THRESHOLD).float()
+        acc["tp"] = acc.get("tp", 0.0) + (pred * target).sum()
+        acc["fp"] = acc.get("fp", 0.0) + (pred * (1 - target)).sum()
+        acc["fn"] = acc.get("fn", 0.0) + ((1 - pred) * target).sum()
+        acc["tn"] = acc.get("tn", 0.0) + ((1 - pred) * (1 - target)).sum()
 
 
 def counts_to_metrics(acc: dict) -> dict:
     """Tính tất cả metric từ TP/FP/FN/TN tích lũy (micro-average đúng chuẩn)."""
-    tp, fp, fn, tn = acc["tp"], acc["fp"], acc["fn"], acc["tn"]
+    # Lấy value từ Tensor (chỉ move về CPU lúc này -> loại bỏ GPU/CPU sync trong vòng lặp)
+    tp = acc["tp"].item() if isinstance(acc["tp"], torch.Tensor) else acc["tp"]
+    fp = acc["fp"].item() if isinstance(acc["fp"], torch.Tensor) else acc["fp"]
+    fn = acc["fn"].item() if isinstance(acc["fn"], torch.Tensor) else acc["fn"]
+    tn = acc["tn"].item() if isinstance(acc["tn"], torch.Tensor) else acc["tn"]
+
     dice = (2 * tp) / (2 * tp + fp + fn + EPS)
     precision = tp / (tp + fp + EPS)
     recall = tp / (tp + fn + EPS)
@@ -272,6 +278,9 @@ def train_one_config(
         optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6
     )
 
+    use_amp = torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     best_dice = -1.0
     best_metrics = {}
     best_epoch = 0
@@ -300,10 +309,16 @@ def train_one_config(
         for imgs, masks, _ in train_loader:
             imgs, masks = imgs.to(device), masks.to(device)
             optimizer.zero_grad()
-            logits = model(imgs)
-            loss = criterion(logits, masks)
-            loss.backward()
-            optimizer.step()
+
+            # Khởi tạo Automatic Mixed Precision
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                logits = model(imgs)
+                loss = criterion(logits, masks)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
             t_loss += loss.item()
             accumulate_counts(t_counts, logits.detach(), masks)  # cộng dồn raw counts
 
@@ -317,8 +332,11 @@ def train_one_config(
         with torch.no_grad():
             for imgs, masks, _ in val_loader:
                 imgs, masks = imgs.to(device), masks.to(device)
-                logits = model(imgs)
-                loss = criterion(logits, masks)
+
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    logits = model(imgs)
+                    loss = criterion(logits, masks)
+
                 v_loss += loss.item()
                 accumulate_counts(v_counts, logits, masks)  # cộng dồn raw counts
 
@@ -473,6 +491,7 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
     )
     val_loader = DataLoader(
         val_ds,
@@ -480,6 +499,7 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
     )
 
     # ── 3 LR configs theo paper ────────────────────────────────────────────
