@@ -1,19 +1,3 @@
-"""
-train_unet.py — Training U-Net cho binary segmentation (snow mask)
-
-Theo paper specs:
-  - Input      : resize 512×512, normalize ImageNet mean/std
-  - Augment    : RandomResizedCrop, HorizontalFlip, Rotation, Affine
-  - Split      : 80 / 20 (train / val)
-  - Loss       : BCEWithLogitsLoss
-  - Optimizer  : Adam + ReduceLROnPlateau(factor=0.5, patience=10)
-  - 3 LR runs  : lr1=1e-4, lr2=3e-4, lr3=1e-3
-  - Epochs     : 200, early-stopping patience=20 theo val Dice
-  - Metrics    : Dice, Precision, Recall, F1, Accuracy, mIoU
-  - Lưu        : best_<lr_tag>.pth (val Dice cao nhất)
-  - Biểu đồ   : results/<lr_tag>_curves.png
-"""
-
 import argparse
 import json
 import random
@@ -31,58 +15,39 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-matplotlib.use("Agg")  # non-interactive backend
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ── Import model ─────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 from unet_model import UNet
 
-# ── Seed ─────────────────────────────────────────────────────────────────────
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
-# ── Đường dẫn mặc định (có thể override qua CLI --img_dir, --label_dir, --result_dir)
 BASE_DIR = Path(__file__).parent
 DEFAULT_IMG_DIR = BASE_DIR / "example"
 DEFAULT_LABEL_DIR = BASE_DIR / "label_unet"
 DEFAULT_RESULT_DIR = BASE_DIR / "results"
 
-IMG_SIZE = 512  # resize về 512×512
-THRESHOLD = 0.5  # ngưỡng sigmoid để ra mask nhị phân
+IMG_SIZE = 512
+THRESHOLD = 0.5
 
-# ImageNet mean/std (phổ biến, chuẩn hoá tốt cho pretrained-style features)
 MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Dataset với augmentation
-# ═══════════════════════════════════════════════════════════════════════════
 class SnowSegDataset(Dataset):
-    """
-    Đọc cặp (ảnh .jpg từ img_dir/, mask .png từ label_dir/).
-    Mode 'train' → áp dụng augmentation.
-    Mode 'val'   → chỉ resize + normalize.
-    """
-
     def __init__(self, img_paths: list, label_dir: Path, mode: str = "train"):
         self.img_paths = img_paths
         self.label_dir = label_dir
         self.mode = mode
         self.img_size = IMG_SIZE
-
-        # Normalize (áp dụng sau khi đã convert sang Tensor)
         self.normalize = transforms.Normalize(mean=MEAN, std=STD)
 
-    # ── Augmentation đồng bộ image + mask ──────────────────────────────────
     def _augment(self, img: Image.Image, mask: Image.Image):
-        """Áp dụng cùng biến đổi hình học lên img và mask."""
-
-        # 1. RandomResizedCrop (scale 0.8–1.0)
         i, j, h, w = transforms.RandomResizedCrop.get_params(
             img, scale=(0.8, 1.0), ratio=(3 / 4, 4 / 3)
         )
@@ -105,19 +70,16 @@ class SnowSegDataset(Dataset):
             TF.InterpolationMode.NEAREST,
         )
 
-        # 2. Horizontal flip (p=0.5)
         if random.random() < 0.5:
             img = TF.hflip(img)
             mask = TF.hflip(mask)
 
-        # 3. Rotation (±20°)
         angle = random.uniform(-20, 20)
         img = TF.rotate(img, angle, interpolation=TF.InterpolationMode.BILINEAR, fill=0)
         mask = TF.rotate(
             mask, angle, interpolation=TF.InterpolationMode.NEAREST, fill=0
         )
 
-        # 4. Affine: translate ±10%, shear ±10° (không rotate thêm vì bước 3 đã rotate)
         affine_params = transforms.RandomAffine.get_params(
             degrees=(0, 0),
             translate=[0.1, 0.1],
@@ -134,7 +96,6 @@ class SnowSegDataset(Dataset):
 
         return img, mask
 
-    # ────────────────────────────────────────────────────────────────────────
     def __len__(self):
         return len(self.img_paths)
 
@@ -143,12 +104,11 @@ class SnowSegDataset(Dataset):
         mask_path = self.label_dir / (img_path.stem + ".png")
 
         img = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")  # grayscale
+        mask = Image.open(mask_path).convert("L")
 
         if self.mode == "train":
             img, mask = self._augment(img, mask)
         else:
-            # Val: chỉ resize
             img = TF.resize(
                 img, (self.img_size, self.img_size), TF.InterpolationMode.BILINEAR
             )
@@ -156,27 +116,19 @@ class SnowSegDataset(Dataset):
                 mask, (self.img_size, self.img_size), TF.InterpolationMode.NEAREST
             )
 
-        # Chuyển sang Tensor
-        img = TF.to_tensor(img)  # [3, H, W], float32 [0,1]
+        img = TF.to_tensor(img)
         img = self.normalize(img)
 
-        arr = np.array(mask)  # uint8
+        arr = np.array(mask)
         mask = torch.from_numpy((arr > 0).astype(np.float32)).unsqueeze(0)
 
         return img, mask, str(img_path.name)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Metrics — micro-average (accumulate raw TP/FP/FN/TN qua cả epoch)
-# ═══════════════════════════════════════════════════════════════════════════
 EPS = 1e-7
 
 
 def accumulate_counts(acc: dict, pred_logits: torch.Tensor, target: torch.Tensor):
-    """
-    Cộng dồn raw TP/FP/FN/TN vào acc cho toàn epoch.
-    acc: dict {'tp', 'fp', 'fn', 'tn'}
-    """
     with torch.no_grad():
         pred = (torch.sigmoid(pred_logits) > THRESHOLD).float()
         acc["tp"] = acc.get("tp", 0.0) + (pred * target).sum()
@@ -186,8 +138,6 @@ def accumulate_counts(acc: dict, pred_logits: torch.Tensor, target: torch.Tensor
 
 
 def counts_to_metrics(acc: dict) -> dict:
-    """Tính tất cả metric từ TP/FP/FN/TN tích lũy (micro-average đúng chuẩn)."""
-    # Lấy value từ Tensor (chỉ move về CPU lúc này -> loại bỏ GPU/CPU sync trong vòng lặp)
     tp = acc["tp"].item() if isinstance(acc["tp"], torch.Tensor) else acc["tp"]
     fp = acc["fp"].item() if isinstance(acc["fp"], torch.Tensor) else acc["fp"]
     fn = acc["fn"].item() if isinstance(acc["fn"], torch.Tensor) else acc["fn"]
@@ -211,18 +161,13 @@ def counts_to_metrics(acc: dict) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Vẽ biểu đồ
-# ═══════════════════════════════════════════════════════════════════════════
 def plot_curves(history: dict, lr_tag: str, result_dir: Path):
-    """Vẽ loss, dice (train+val), và các val metric (1 đường). Lưu vào results/."""
     epochs = range(1, len(history["train_loss"]) + 1)
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle(f"Training Curves  |  {lr_tag}", fontsize=14)
 
     def _plot_both(ax, train_vals, val_vals, ylabel):
-        """Vẽ 2 đường: train vs val (dùng cho loss và dice)."""
         ax.plot(epochs, train_vals, label="train")
         ax.plot(epochs, val_vals, label="val", linestyle="--")
         ax.set_xlabel("Epoch")
@@ -232,7 +177,6 @@ def plot_curves(history: dict, lr_tag: str, result_dir: Path):
         ax.grid(True, alpha=0.3)
 
     def _plot_val(ax, val_vals, ylabel):
-        """Vẽ 1 đường val-only (precision/recall/F1/mIoU)."""
         ax.plot(epochs, val_vals, color="tab:orange", label="val")
         ax.set_xlabel("Epoch")
         ax.set_ylabel(ylabel)
@@ -254,9 +198,6 @@ def plot_curves(history: dict, lr_tag: str, result_dir: Path):
     print(f"  [PLOT] Lưu biểu đồ: {save_path}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Training một lần với lr cụ thể
-# ═══════════════════════════════════════════════════════════════════════════
 def train_one_config(
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -303,14 +244,12 @@ def train_one_config(
     }
 
     for epoch in range(1, max_epochs + 1):
-        # ── Train ──────────────────────────────────────────────────────────
         model.train()
         t_loss, t_counts = 0.0, {}
         for imgs, masks, _ in train_loader:
             imgs, masks = imgs.to(device), masks.to(device)
             optimizer.zero_grad()
 
-            # Khởi tạo Automatic Mixed Precision
             with torch.cuda.amp.autocast(enabled=use_amp):
                 logits = model(imgs)
                 loss = criterion(logits, masks)
@@ -320,13 +259,12 @@ def train_one_config(
             scaler.update()
 
             t_loss += loss.item()
-            accumulate_counts(t_counts, logits.detach(), masks)  # cộng dồn raw counts
+            accumulate_counts(t_counts, logits.detach(), masks)
 
         n_train = len(train_loader)
         t_loss /= n_train
-        t_metrics = counts_to_metrics(t_counts)  # micro-average toàn epoch
+        t_metrics = counts_to_metrics(t_counts)
 
-        # ── Val ────────────────────────────────────────────────────────────
         model.eval()
         v_loss, v_counts = 0.0, {}
         with torch.no_grad():
@@ -338,16 +276,14 @@ def train_one_config(
                     loss = criterion(logits, masks)
 
                 v_loss += loss.item()
-                accumulate_counts(v_counts, logits, masks)  # cộng dồn raw counts
+                accumulate_counts(v_counts, logits, masks)
 
         n_val = len(val_loader)
         v_loss /= n_val
-        v_metrics = counts_to_metrics(v_counts)  # micro-average toàn epoch
+        v_metrics = counts_to_metrics(v_counts)
 
-        # Scheduler bước theo val loss
         scheduler.step(v_loss)
 
-        # Ghi history
         history["train_loss"].append(t_loss)
         history["val_loss"].append(v_loss)
         history["train_dice"].append(t_metrics["dice"])
@@ -355,7 +291,6 @@ def train_one_config(
         for k in ["precision", "recall", "f1", "accuracy", "miou"]:
             history[f"val_{k}"].append(v_metrics[k])
 
-        # Log mỗi 10 epoch
         if epoch % 10 == 0 or epoch == 1:
             print(
                 f"  Epoch {epoch:3d}/{max_epochs} | "
@@ -364,7 +299,6 @@ def train_one_config(
                 f"mIoU={v_metrics['miou']:.4f}  F1={v_metrics['f1']:.4f}"
             )
 
-        # Lưu model tốt nhất
         if v_metrics["dice"] > best_dice:
             best_dice = v_metrics["dice"]
             best_epoch = epoch
@@ -391,7 +325,6 @@ def train_one_config(
         else:
             no_improve += 1
 
-        # Early stopping
         if no_improve >= early_patience:
             print(
                 f"\n  [EARLY STOP] Không cải thiện sau {early_patience} epoch. Dừng tại epoch {epoch}."
@@ -402,10 +335,8 @@ def train_one_config(
         f"\n  Best val Dice ({lr_tag}): {best_dice:.4f}  @ epoch {best_epoch}  → lưu tại {best_path}"
     )
 
-    # Vẽ biểu đồ
     plot_curves(history, lr_tag, result_dir)
 
-    # Lưu history JSON
     hist_path = result_dir / f"{lr_tag}_history.json"
     with open(hist_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
@@ -413,42 +344,18 @@ def train_one_config(
     return best_epoch, best_metrics
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════════════
 def main():
     parser = argparse.ArgumentParser(description="Train U-Net for snow segmentation")
-    parser.add_argument(
-        "--img_dir",
-        type=str,
-        default=None,
-        help="Thư mục chứa ảnh đầu vào (.jpg). Mặc định: <script_dir>/example",
-    )
-    parser.add_argument(
-        "--label_dir",
-        type=str,
-        default=None,
-        help="Thư mục chứa mask nhãn (.png). Mặc định: <script_dir>/label_unet",
-    )
-    parser.add_argument(
-        "--result_dir",
-        type=str,
-        default=None,
-        help="Thư mục lưu kết quả (model, biểu đồ). Mặc định: <script_dir>/results",
-    )
+    parser.add_argument("--img_dir", type=str, default=None)
+    parser.add_argument("--label_dir", type=str, default=None)
+    parser.add_argument("--result_dir", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=200)
     parser.add_argument("--early_patience", type=int, default=20)
     parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=None,
-        help="Chỉ chạy 1 LR cụ thể thay vì cả 3. Ví dụ: --lr 1e-4",
-    )
+    parser.add_argument("--lr", type=float, default=None)
     args = parser.parse_args()
 
-    # ── Xác định đường dẫn ───────────────────────────────────────────────────
     img_dir = Path(args.img_dir) if args.img_dir else DEFAULT_IMG_DIR
     label_dir = Path(args.label_dir) if args.label_dir else DEFAULT_LABEL_DIR
     result_dir = Path(args.result_dir) if args.result_dir else DEFAULT_RESULT_DIR
@@ -460,7 +367,6 @@ def main():
     print(f"label_dir  : {label_dir}")
     print(f"result_dir : {result_dir}")
 
-    # ── Tìm tất cả ảnh .jpg trong img_dir/ có nhãn tương ứng ──────────────
     all_imgs = sorted(
         [
             p
@@ -471,7 +377,6 @@ def main():
     )
     print(f"Tổng cặp image–mask: {len(all_imgs)}")
 
-    # ── Split 80/20 ────────────────────────────────────────────────────────
     n_total = len(all_imgs)
     n_train = int(n_total * 0.8)
 
@@ -502,12 +407,7 @@ def main():
         persistent_workers=(args.num_workers > 0),
     )
 
-    # ── 3 LR configs theo paper ────────────────────────────────────────────
-    lr_configs = [
-        (1e-4, "lr1"),
-        (3e-4, "lr2"),
-        (1e-3, "lr3"),
-    ]
+    lr_configs = [(1e-4, "lr1"), (3e-4, "lr2"), (1e-3, "lr3")]
 
     if args.lr is not None:
         lr_configs = [(args.lr, f"lr_{args.lr:.0e}")]
@@ -524,14 +424,9 @@ def main():
             max_epochs=args.max_epochs,
             early_patience=args.early_patience,
         )
-        summary[lr_tag] = {
-            "lr": lr,
-            "best_epoch": best_epoch,
-            **best_metrics,
-        }
+        summary[lr_tag] = {"lr": lr, "best_epoch": best_epoch, **best_metrics}
 
-    # ── Bảng tổng kết chi tiết ─────────────────────────────────────────────
-    col_w = 10  # độ rộng mỗi cột metric
+    col_w = 10
     metrics_order = ["dice", "precision", "recall", "f1", "accuracy", "miou"]
     header_names = ["Dice", "Precision", "Recall", "F1", "Accuracy", "mIoU"]
 
@@ -540,14 +435,12 @@ def main():
     print("  📊  KẾT QUẢ TỔNG KẾT SAU TRAINING")
     print(f"{'═' * len(sep)}")
 
-    # Header
     row_fmt = "  {:<8}  {:<6}  {:<8}"
     for _ in metrics_order:
         row_fmt += f"  {{:>{col_w}}}"
     print(row_fmt.format("Tag", "LR", "BestEpoch", *header_names))
     print(sep)
 
-    # Tìm giá trị cao nhất cho từng metric để highlight
     best_vals = {m: max(info[m] for info in summary.values()) for m in metrics_order}
 
     for tag, info in summary.items():
@@ -556,8 +449,8 @@ def main():
         for m in metrics_order:
             v = info[m]
             cell = f"{v:.4f}"
-            if abs(v - best_vals[m]) < 1e-9:  # là giá trị tốt nhất
-                cell = f"★{v:.4f}"  # đánh dấu sao
+            if abs(v - best_vals[m]) < 1e-9:
+                cell = f"★{v:.4f}"
             vals.append(cell.rjust(col_w))
         print(f"  {tag:<8}  {lr_str:<6}  {info['best_epoch']:<8}  {'  '.join(vals)}")
 
@@ -565,7 +458,6 @@ def main():
     print("  ★ = giá trị tốt nhất trong nhóm LR")
     print(f"{'═' * len(sep)}\n")
 
-    # Lưu summary JSON
     summary_path = result_dir / "summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

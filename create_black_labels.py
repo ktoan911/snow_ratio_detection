@@ -1,25 +1,14 @@
-"""
-Script tạo ảnh nhãn đen cho các ảnh trong thư mục `example`
-mà không có nhãn tương ứng trong thư mục `label_unet`.
-
-- Input: ảnh .jpg trong thư mục example/ (ví dụ: a.jpg)
-- Label tương ứng: label_unet/a.png
-- Nếu nhãn không tồn tại → tạo ảnh đen cùng kích thước, lưu vào label_unet/a.png
-"""
-
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-# ── Cấu hình đường dẫn ──────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 EXAMPLE_DIR = BASE_DIR / "example"
 LABEL_DIR = BASE_DIR / "label_unet"
 
 LABEL_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Lấy danh sách ảnh trong example (chỉ .jpg và .jpeg) ─────────────────────
 IMAGE_EXTENSIONS = {".jpg", ".jpeg"}
 
 example_images = [
@@ -32,14 +21,12 @@ created = 0
 already_exists = 0
 
 for img_path in sorted(example_images):
-    # Tên nhãn tương ứng (cùng stem, đuôi .png)
     label_path = LABEL_DIR / (img_path.stem + ".png")
 
     if label_path.exists():
         already_exists += 1
         continue
 
-    # Đọc ảnh gốc để lấy kích thước
     try:
         with Image.open(img_path) as img:
             width, height = img.size
@@ -47,7 +34,6 @@ for img_path in sorted(example_images):
         print(f"  [LỖI] Không thể đọc {img_path.name}: {e}")
         continue
 
-    # Tạo ảnh đen cùng kích thước (mode L = grayscale hoặc RGB tuỳ bạn cần)
     black_img = Image.fromarray(np.zeros((height, width), dtype=np.uint8), mode="L")
     black_img.save(label_path, format="PNG")
 

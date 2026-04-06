@@ -1,20 +1,3 @@
-"""
-train_yolo.py — Finetune YOLOv8s-seg cho binary segmentation (snow mask)
-
-Cấu trúc giống train_unet.py:
-  - Input      : resize 640×640 (YOLO default), normalize nội bộ bởi ultralytics
-  - Augment    : dùng augmentation mặc định của ultralytics (hsv, flip, mosaic…)
-  - Split      : 80 / 20 (train / val) — tạo dataset YOLO tạm thời trên disk
-  - 3 LR runs  : lr1=1e-4, lr2=3e-4, lr3=1e-3
-  - Epochs     : 200, early-stopping patience=20 (theo val Dice tự tính)
-  - Metrics    : Dice, Precision, Recall, F1, Accuracy, mIoU
-  - Lưu        : best_<lr_tag>/weights/best.pt  (val Dice cao nhất)
-  - Biểu đồ   : results/<lr_tag>_curves.png
-
-Yêu cầu:
-    pip install ultralytics
-"""
-
 import argparse
 import json
 import random
@@ -31,7 +14,6 @@ from PIL import Image
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ── ultralytics ───────────────────────────────────────────────────────────────
 try:
     import yaml as _yaml
     from ultralytics import YOLO
@@ -39,36 +21,25 @@ except ImportError:
     print("[ERROR] Cần cài ultralytics: pip install ultralytics")
     raise
 
-# ── Seed ─────────────────────────────────────────────────────────────────────
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
-# ── Đường dẫn mặc định ────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 DEFAULT_IMG_DIR = BASE_DIR / "example"
 DEFAULT_LABEL_DIR = BASE_DIR / "label_unet"
 DEFAULT_RESULT_DIR = BASE_DIR / "results"
 
-IMG_SIZE = 640  # YOLO default
-THRESHOLD = 0.5  # ngưỡng tạo binary mask từ polygon khi tính metrics
+IMG_SIZE = 640
+THRESHOLD = 0.5
 
 EPS = 1e-7
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Tiện ích: chuyển binary mask PNG → YOLO polygon label (class 0)
-# ═══════════════════════════════════════════════════════════════════════════
 def mask_png_to_yolo_label(mask_path: Path, label_path: Path):
-    """
-    Đọc mask grayscale (0/255), tìm contour, xuất YOLO-seg format:
-      0 x1 y1 x2 y2 … (tọa độ chuẩn hóa [0,1])
-    Nếu không có contour (ảnh trắng toàn bộ hoặc đen toàn bộ) → file rỗng.
-    """
     arr = np.array(Image.open(mask_path).convert("L"))
-    # Hỗ trợ cả mask 0/1 (label_unet) lẫn 0/255
     binary = (arr > 0).astype(np.uint8) * 255
     h, w = binary.shape
 
@@ -78,7 +49,6 @@ def mask_png_to_yolo_label(mask_path: Path, label_path: Path):
     for cnt in contours:
         if cnt.shape[0] < 3:
             continue
-        # Epsilon-approximation để giảm điểm
         epsilon = 0.005 * cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, epsilon, True)
         pts = approx.reshape(-1, 2)
@@ -93,25 +63,12 @@ def mask_png_to_yolo_label(mask_path: Path, label_path: Path):
         f.write("\n".join(lines))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Tạo cấu trúc YOLO dataset tạm thời trên disk
-# ═══════════════════════════════════════════════════════════════════════════
 def build_yolo_dataset(
     train_imgs: list[Path],
     val_imgs: list[Path],
     label_dir: Path,
     tmp_dir: Path,
 ) -> Path:
-    """
-    Tạo cây thư mục:
-      tmp_dir/
-        images/train/  ← symlink hoặc copy ảnh
-        images/val/
-        labels/train/  ← label YOLO polygon
-        labels/val/
-        dataset.yaml
-    Trả về đường dẫn dataset.yaml.
-    """
     for split, imgs in [("train", train_imgs), ("val", val_imgs)]:
         img_out = tmp_dir / "images" / split
         lbl_out = tmp_dir / "labels" / split
@@ -119,16 +76,13 @@ def build_yolo_dataset(
         lbl_out.mkdir(parents=True, exist_ok=True)
 
         for p in imgs:
-            # Copy ảnh
             dst_img = img_out / p.name
             shutil.copy2(p, dst_img)
 
-            # Tạo label polygon
             mask_path = label_dir / (p.stem + ".png")
             lbl_path = lbl_out / (p.stem + ".txt")
             mask_png_to_yolo_label(mask_path, lbl_path)
 
-    # dataset.yaml
     yaml_path = tmp_dir / "dataset.yaml"
     cfg = {
         "path": str(tmp_dir),
@@ -143,11 +97,7 @@ def build_yolo_dataset(
     return yaml_path
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Metrics — tính trực tiếp từ YOLO mask predictions
-# ═══════════════════════════════════════════════════════════════════════════
 def compute_dice_from_masks(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
-    """Tính Dice/Precision/Recall/F1/Accuracy/mIoU từ cặp binary mask (bool)."""
     tp = float(np.logical_and(pred_mask, gt_mask).sum())
     fp = float(np.logical_and(pred_mask, ~gt_mask).sum())
     fn = float(np.logical_and(~pred_mask, gt_mask).sum())
@@ -179,14 +129,9 @@ def accumulate_metrics(
     label_dir: Path,
     device: str,
 ):
-    """
-    Chạy inference trên từng ảnh, so sánh mask predict vs GT mask,
-    cộng dồn TP/FP/FN/TN.
-    """
     tp_total = fp_total = fn_total = tn_total = 0.0
 
     for p in img_paths:
-        # ── GT mask ──────────────────────────────────────────────────────
         mask_path = label_dir / (p.stem + ".png")
         gt = (
             np.array(
@@ -194,14 +139,13 @@ def accumulate_metrics(
                 .convert("L")
                 .resize((IMG_SIZE, IMG_SIZE), Image.NEAREST)
             )
-            > 0  # dùng > 0 thay vì > 127 vì mask label_unet lưu giá trị 0/1 (không phải 0/255)
-        )  # bool HxW
+            > 0
+        )
 
-        # ── Predict ──────────────────────────────────────────────────────
         results = model.predict(
             str(p),
             imgsz=IMG_SIZE,
-            conf=0.01,  # thấp để catch prediction dù model chưa confident
+            conf=0.01,
             iou=0.3,
             device=device,
             verbose=False,
@@ -211,7 +155,7 @@ def accumulate_metrics(
 
         pred = np.zeros((IMG_SIZE, IMG_SIZE), dtype=bool)
         if r.masks is not None:
-            for seg_mask in r.masks.data.cpu().numpy():  # (H', W')
+            for seg_mask in r.masks.data.cpu().numpy():
                 seg_resized = cv2.resize(
                     seg_mask.astype(np.uint8),
                     (IMG_SIZE, IMG_SIZE),
@@ -250,11 +194,7 @@ def counts_to_metrics(acc: dict) -> dict:
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Vẽ biểu đồ (giống train_unet.py)
-# ═══════════════════════════════════════════════════════════════════════════
 def plot_curves(history: dict, lr_tag: str, result_dir: Path):
-    """Vẽ loss, dice (train+val), và các val metric (1 đường). Lưu vào results/."""
     epochs = range(1, len(history["train_loss"]) + 1)
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
@@ -291,9 +231,6 @@ def plot_curves(history: dict, lr_tag: str, result_dir: Path):
     print(f"  [PLOT] Lưu biểu đồ: {save_path}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Finetune một lần với lr cụ thể  — dùng ultralytics callback
-# ═══════════════════════════════════════════════════════════════════════════
 def train_one_config(
     yaml_path: Path,
     train_imgs: list[Path],
@@ -314,7 +251,6 @@ def train_one_config(
     run_dir = result_dir / f"best_{lr_tag}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── State được chia sẻ với callback (dùng dict để tránh closure capture issue) ──
     state = {
         "history": {
             k: []
@@ -337,12 +273,9 @@ def train_one_config(
         "stop": False,
     }
 
-    # ── Callback chạy sau mỗi epoch (train + val hoàn chỉnh) ───────────────
-    # on_fit_epoch_end nhận Trainer trực tiếp (khác on_val_end nhận Validator)
     def on_fit_epoch_end(trainer):
-        epoch = trainer.epoch + 1  # ultralytics dùng 0-indexed
+        epoch = trainer.epoch + 1
 
-        # ── Train / Val loss từ trainer.metrics ──────────────────────────
         rd = trainer.metrics if hasattr(trainer, "metrics") else {}
         t_loss = float(
             rd.get(
@@ -354,15 +287,13 @@ def train_one_config(
             rd.get("val/seg_loss", rd.get("val/loss", rd.get("val(B)/seg_loss", 0.0)))
         )
 
-        # ── Custom metrics: dùng last.pt vừa lưu (on_fit_epoch_end fire
-        #    sau save_model) hoặc fallback sang best.pt/trainer weights ──
         last_pt = run_dir / "train" / "weights" / "last.pt"
         best_pt = run_dir / "train" / "weights" / "best.pt"
         weight_path = (
             last_pt if last_pt.exists() else (best_pt if best_pt.exists() else None)
         )
         if weight_path is None:
-            return  # epoch 1 chưa lưu gì, bỏ qua
+            return
 
         yolo_model = YOLO(str(weight_path))
 
@@ -372,7 +303,6 @@ def train_one_config(
         t_metrics = counts_to_metrics(t_counts)
         v_metrics = counts_to_metrics(v_counts)
 
-        # Ghi history
         h = state["history"]
         h["train_loss"].append(t_loss)
         h["val_loss"].append(v_loss)
@@ -381,7 +311,6 @@ def train_one_config(
         for k in ["precision", "recall", "f1", "accuracy", "miou"]:
             h[f"val_{k}"].append(v_metrics[k])
 
-        # Log mỗi 10 epoch
         if epoch % 10 == 0 or epoch == 1:
             print(
                 f"  Epoch {epoch:3d}/{max_epochs} | "
@@ -390,7 +319,6 @@ def train_one_config(
                 f"mIoU={v_metrics['miou']:.4f}  F1={v_metrics['f1']:.4f}"
             )
 
-        # Early stopping theo val Dice
         if v_metrics["dice"] > state["best_dice"]:
             state["best_dice"] = v_metrics["dice"]
             state["best_epoch"] = epoch
@@ -405,7 +333,6 @@ def train_one_config(
             }
             state["no_improve"] = 0
 
-            # Copy best weights
             candidate = (
                 best_pt if best_pt.exists() else (last_pt if last_pt.exists() else None)
             )
@@ -414,7 +341,6 @@ def train_one_config(
         else:
             state["no_improve"] += 1
 
-        # Báo trainer dừng khi hết patience
         if state["no_improve"] >= early_patience:
             print(
                 f"\n  [EARLY STOP] Không cải thiện sau {early_patience} epoch. "
@@ -422,26 +348,23 @@ def train_one_config(
             )
             trainer.stop = True
 
-    # ── Load model và gắn callback ────────────────────────────────────────
     model = YOLO("yolov8s-seg.pt")
     model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
 
-    # ── Train toàn bộ epochs trong 1 lần gọi ─────────────────────────────
     model.train(
         data=str(yaml_path),
         epochs=max_epochs,
         imgsz=IMG_SIZE,
         batch=batch_size,
         lr0=lr,
-        lrf=0.01,  # cosine decay từ lr0 → lr0*0.01 theo đúng schedule
-        warmup_epochs=3,  # warmup chuẩn (3 epoch đầu)
+        lrf=0.01,
+        warmup_epochs=3,
         optimizer="Adam",
         device=device,
         project=str(run_dir),
         name="train",
         exist_ok=True,
         verbose=False,
-        # Augmentation
         mosaic=0.0,
         mixup=0.0,
         copy_paste=0.0,
@@ -450,9 +373,9 @@ def train_one_config(
         flipud=0.0,
         fliplr=0.5,
         seed=SEED,
-        patience=0,  # tắt YOLO early-stopping, dùng callback tự quản
+        patience=0,
         save=True,
-        save_period=-1,  # chỉ lưu best.pt + last.pt, không lưu epoch*.pt (tốn disk)
+        save_period=-1,
     )
 
     best_dice = state["best_dice"]
@@ -466,10 +389,8 @@ def train_one_config(
         f"@ epoch {best_epoch}  → lưu tại {best_pt_src}"
     )
 
-    # Vẽ biểu đồ
     plot_curves(history, lr_tag, result_dir)
 
-    # Lưu history JSON
     hist_path = result_dir / f"{lr_tag}_history.json"
     with open(hist_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
@@ -477,46 +398,20 @@ def train_one_config(
     return best_epoch, best_metrics
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════════════
 def main():
     parser = argparse.ArgumentParser(
         description="Finetune YOLOv8s-seg for snow segmentation"
     )
-    parser.add_argument(
-        "--img_dir",
-        type=str,
-        default=None,
-        help="Thư mục chứa ảnh .jpg. Mặc định: <script_dir>/example",
-    )
-    parser.add_argument(
-        "--label_dir",
-        type=str,
-        default=None,
-        help="Thư mục chứa mask .png. Mặc định: <script_dir>/label_unet",
-    )
-    parser.add_argument(
-        "--result_dir",
-        type=str,
-        default=None,
-        help="Thư mục lưu kết quả. Mặc định: <script_dir>/results",
-    )
+    parser.add_argument("--img_dir", type=str, default=None)
+    parser.add_argument("--label_dir", type=str, default=None)
+    parser.add_argument("--result_dir", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=200)
     parser.add_argument("--early_patience", type=int, default=20)
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=2,
-        help="Số worker DataLoader (truyền vào ultralytics workers).",
-    )
-    parser.add_argument(
-        "--lr", type=float, default=None, help="Chỉ chạy 1 LR cụ thể. Ví dụ: --lr 1e-4"
-    )
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=None)
     args = parser.parse_args()
 
-    # ── Paths ─────────────────────────────────────────────────────────────
     img_dir = Path(args.img_dir) if args.img_dir else DEFAULT_IMG_DIR
     label_dir = Path(args.label_dir) if args.label_dir else DEFAULT_LABEL_DIR
     result_dir = Path(args.result_dir) if args.result_dir else DEFAULT_RESULT_DIR
@@ -528,7 +423,6 @@ def main():
     print(f"label_dir  : {label_dir}")
     print(f"result_dir : {result_dir}")
 
-    # ── Tìm tất cả ảnh .jpg có mask tương ứng ────────────────────────────
     all_imgs = sorted(
         [
             p
@@ -539,7 +433,6 @@ def main():
     )
     print(f"Tổng cặp image–mask: {len(all_imgs)}")
 
-    # ── Split 80/20 ───────────────────────────────────────────────────────
     n_total = len(all_imgs)
     n_train = int(n_total * 0.8)
     generator = torch.Generator().manual_seed(SEED)
@@ -548,18 +441,12 @@ def main():
     val_imgs = [all_imgs[i] for i in indices[n_train:]]
     print(f"Train: {len(train_imgs)}  |  Val: {len(val_imgs)}")
 
-    # ── Tạo YOLO dataset tạm thời ─────────────────────────────────────────
     tmp_dir = Path(tempfile.mkdtemp(prefix="yolo_snow_"))
     print(f"Dataset tạm: {tmp_dir}")
     try:
         yaml_path = build_yolo_dataset(train_imgs, val_imgs, label_dir, tmp_dir)
 
-        # ── 3 LR configs theo paper ───────────────────────────────────────
-        lr_configs = [
-            (1e-4, "lr1"),
-            (3e-4, "lr2"),
-            (1e-3, "lr3"),
-        ]
+        lr_configs = [(1e-4, "lr1"), (3e-4, "lr2"), (1e-3, "lr3")]
         if args.lr is not None:
             lr_configs = [(args.lr, f"lr_{args.lr:.0e}")]
 
@@ -584,7 +471,6 @@ def main():
         shutil.rmtree(tmp_dir, ignore_errors=True)
         print(f"\n[INFO] Đã xóa dataset tạm: {tmp_dir}")
 
-    # ── Bảng tổng kết chi tiết (giống train_unet.py) ──────────────────────
     col_w = 10
     metrics_order = ["dice", "precision", "recall", "f1", "accuracy", "miou"]
     header_names = ["Dice", "Precision", "Recall", "F1", "Accuracy", "mIoU"]
@@ -600,7 +486,6 @@ def main():
     print(row_fmt.format("Tag", "LR", "BestEpoch", *header_names))
     print(sep)
 
-    # Nếu callback không chạy được (ví dụ history rỗng), fallback sang 0.0
     for tag, info in summary.items():
         for m in metrics_order:
             if m not in info:
@@ -623,7 +508,6 @@ def main():
     print("  ★ = giá trị tốt nhất trong nhóm LR")
     print(f"{'═' * len(sep)}\n")
 
-    # Lưu summary JSON
     summary_path = result_dir / "summary_yolo.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
